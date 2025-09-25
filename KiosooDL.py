@@ -8,9 +8,30 @@ import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QTextEdit, QProgressBar, QFileDialog, QCheckBox,
-    QRadioButton, QButtonGroup, QMessageBox, QListWidget, QListWidgetItem
+    QRadioButton, QButtonGroup, QMessageBox, QListWidget, QListWidgetItem,
+    QTabWidget, QInputDialog, QAbstractItemView
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
+
+# -----------------------
+# Helper: subprocess kwargs to hide windows on Windows
+# -----------------------
+def get_subprocess_kwargs():
+    """
+    Returns kwargs dict to pass to subprocess.run / subprocess.Popen so that on
+    Windows child console windows are not shown. On other platforms returns {}.
+    """
+    kwargs = {}
+    if os.name == "nt":
+        # Prefer CREATE_NO_WINDOW when available
+        try:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        except Exception:
+            # fallback to STARTUPINFO approach
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            kwargs["startupinfo"] = si
+    return kwargs
 
 # -----------------------
 # Helper: find yt-dlp executable name
@@ -29,11 +50,12 @@ def find_ytdlp_executable():
                 return name
             else:
                 if os.name == "nt":
-                    res = subprocess.run(["where", name], capture_output=True, text=True)
+                    # use kwargs to avoid popping console
+                    res = subprocess.run(["where", name], capture_output=True, text=True, **get_subprocess_kwargs())
                     if res.returncode == 0 and res.stdout.strip():
                         return name
                 else:
-                    res = subprocess.run(["which", name], capture_output=True, text=True)
+                    res = subprocess.run(["which", name], capture_output=True, text=True, **get_subprocess_kwargs())
                     if res.returncode == 0 and res.stdout.strip():
                         return name
         except Exception:
@@ -43,6 +65,112 @@ def find_ytdlp_executable():
 YTDLP_CMD = find_ytdlp_executable()
 
 # -----------------------
+# Worker thread: List formats
+# -----------------------
+class ListFormatsThread(QThread):
+    result_signal = pyqtSignal(list, str)  # list of (format_id, line), url
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        self.log_signal.emit(f"📑 Đang lấy formats cho: {self.url}")
+        cmd = [YTDLP_CMD, "--list-formats", self.url]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True, **get_subprocess_kwargs())
+            lines = proc.stdout.splitlines()
+            formats = []
+            # skip header lines until we find a table: heuristics
+            for line in lines:
+                if not line.strip():
+                    continue
+                # skip header-like lines
+                if re.search(r'format|format code|ID', line, re.I) and len(line.split()) > 1 and not re.match(r'^\s*\d', line):
+                    continue
+                # skip separator lines
+                if re.match(r'^[\-\=]{2,}$', line.strip()):
+                    continue
+                # attempt to get first token as id
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                fid = parts[0]
+                # avoid lines that are summary lines like "Sorted by" etc.
+                if re.search(r'^[A-Za-z]', fid) and not re.match(r'^\d', fid):
+                    # try to find a token that looks like an id
+                    found = False
+                    for tok in parts:
+                        if re.match(r'^[0-9A-Za-z\+\-\.]+$', tok):
+                            fid = tok
+                            found = True
+                            break
+                    if not found:
+                        continue
+                formats.append((fid, line.rstrip()))
+            if not formats:
+                self.log_signal.emit("⚠️ Không lấy được bất kỳ format nào.")
+            else:
+                self.log_signal.emit(f"✅ Lấy được {len(formats)} format.")
+            self.result_signal.emit(formats, self.url)
+        except subprocess.CalledProcessError as e:
+            stderr = getattr(e, "stderr", None)
+            self.log_signal.emit(f"❌ yt-dlp trả về lỗi khi list formats: {(stderr.strip() if stderr else e)}")
+            self.result_signal.emit([], self.url)
+        except Exception as e:
+            self.log_signal.emit(f"❌ Lỗi khi list formats: {e}")
+            self.result_signal.emit([], self.url)
+
+# -----------------------
+# Worker: find/extract playlist/channel ids
+# -----------------------
+class ExtractThread(QThread):
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(list)
+
+    def __init__(self, url, save_path, batch_size=50):
+        super().__init__()
+        self.url = url
+        self.save_path = save_path
+        self.batch_size = batch_size
+
+    def run(self):
+        self.log_signal.emit("📑 Bắt đầu trích xuất danh sách video...")
+        cmd = [YTDLP_CMD, "--flat-playlist", "--get-id", self.url]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True, **get_subprocess_kwargs())
+            ids = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            if not ids:
+                self.log_signal.emit("⚠️ Không tìm thấy video nào.")
+                self.finished_signal.emit([])
+                return
+
+            links = [f"https://www.youtube.com/watch?v={vid}" for vid in ids]
+            total = len(links)
+            parts = []
+            for i in range(0, total, self.batch_size):
+                part = links[i:i+self.batch_size]
+                start = i+1
+                end = i + len(part)
+                filename = os.path.join(self.save_path, f"playlist_{start}-{end}.txt")
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write("\n".join(part))
+                parts.append(filename)
+                self.log_signal.emit(f"✅ Lưu {len(part)} links -> {os.path.basename(filename)}")
+
+            self.log_signal.emit(f"🔚 Trích xuất hoàn tất. Tổng {total} video, chia thành {len(parts)} file.")
+            self.finished_signal.emit(parts)
+
+        except subprocess.CalledProcessError as e:
+            stderr = getattr(e, "stderr", None)
+            self.log_signal.emit(f"❌ Lỗi khi extract: {(stderr.strip() if stderr else e)}")
+            self.finished_signal.emit([])
+        except Exception as e:
+            self.log_signal.emit(f"❌ Lỗi khi extract: {e}")
+            self.finished_signal.emit([])
+
+# -----------------------
 # Worker thread for downloading
 # -----------------------
 class DownloadThread(QThread):
@@ -50,27 +178,30 @@ class DownloadThread(QThread):
     percent_signal = pyqtSignal(int)
     finished_signal = pyqtSignal()
 
-    def __init__(self, urls, quality_key, options, save_path):
+    def __init__(self, urls, quality_key, options, save_path, archive_file=None):
         super().__init__()
         self.urls = urls[:]
-        self.quality_key = quality_key
+        self.quality_key = quality_key  # could be "Best", "720p", "Custom:137", or format_id string
         self.options = options
         self.save_path = save_path
+        self.archive_file = archive_file
         self.process = None
         self._stop_requested = False
 
     def build_format(self):
+        # If quality_key starts with "Custom:" or "custom:", return the id after colon
+        if isinstance(self.quality_key, str) and (self.quality_key.lower().startswith("custom:") or self.quality_key.lower().startswith("format:")):
+            return self.quality_key.split(":", 1)[1]
         if self.quality_key == "Best":
-            fmt = "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio"
+            return "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio"
         elif self.quality_key == "720p":
-            fmt = ("bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]"
-                   "/bestvideo[height<=720]+bestaudio")
+            return ("bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]"
+                    "/bestvideo[height<=720]+bestaudio")
         elif self.quality_key == "480p":
-            fmt = ("bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]"
-                   "/bestvideo[height<=480]+bestaudio")
+            return ("bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]"
+                    "/bestvideo[height<=480]+bestaudio")
         else:
-            fmt = "bestaudio[ext=m4a]/bestaudio"
-        return fmt
+            return "bestaudio[ext=m4a]/bestaudio"
 
     def run(self):
         fmt = self.build_format()
@@ -101,11 +232,17 @@ class DownloadThread(QThread):
                 cmd += ["--write-info-json"]
             if self.options.get("concurrent_fragments", True):
                 cmd += ["--concurrent-fragments", "5"]
+
+            if self.archive_file:
+                cmd += ["--download-archive", self.archive_file]
+
             cmd += [url]
 
             try:
+                # use kwargs to hide console window on Windows
+                popen_kwargs = get_subprocess_kwargs()
                 self.process = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, **popen_kwargs
                 )
             except Exception as e:
                 self.log_signal.emit(f"❌ Không thể chạy yt-dlp: {e}")
@@ -124,6 +261,7 @@ class DownloadThread(QThread):
                 line = raw_line.rstrip("\n")
                 self.log_signal.emit(line)
 
+                # tìm phần trăm tiến độ (cố gắng bắt nhiều mẫu)
                 m = re.search(r"(\d{1,3}(?:\.\d+)?)%", line)
                 if m:
                     try:
@@ -134,9 +272,12 @@ class DownloadThread(QThread):
 
             try:
                 rc = self.process.wait()
+                # handle common Windows "terminated" code 0xC000013A (3221225786) and its signed form
                 if rc == 0:
                     self.percent_signal.emit(100)
                     self.log_signal.emit(f"✅ Hoàn tất video {idx}/{total}")
+                elif rc in (3221225786, -1073741510):
+                    self.log_signal.emit(f"⛔ Quá trình đã bị hủy (mã exit: {rc}).")
                 else:
                     self.log_signal.emit(f"⚠️ yt-dlp trả về mã {rc} cho {url}")
             except Exception as e:
@@ -156,59 +297,29 @@ class DownloadThread(QThread):
                 pass
 
 # -----------------------
-# Worker for extracting playlist/channel
-# -----------------------
-class ExtractThread(QThread):
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(list)
-
-    def __init__(self, url, save_path, batch_size=50):
-        super().__init__()
-        self.url = url
-        self.save_path = save_path
-        self.batch_size = batch_size
-
-    def run(self):
-        self.log_signal.emit("📑 Bắt đầu trích xuất danh sách video...")
-        cmd = [YTDLP_CMD, "--flat-playlist", "--get-id", self.url]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            ids = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-            if not ids:
-                self.log_signal.emit("⚠️ Không tìm thấy video nào.")
-                self.finished_signal.emit([])
-                return
-
-            links = [f"https://www.youtube.com/watch?v={vid}" for vid in ids]
-            total = len(links)
-            parts = []
-            for i in range(0, total, self.batch_size):
-                part = links[i:i+self.batch_size]
-                start = i+1
-                end = i + len(part)
-                filename = os.path.join(self.save_path, f"playlist_{start}-{end}.txt")
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write("\n".join(part))
-                parts.append(filename)
-                self.log_signal.emit(f"✅ Lưu {len(part)} links -> {os.path.basename(filename)}")
-
-            self.log_signal.emit(f"🔚 Trích xuất hoàn tất. Tổng {total} video, chia thành {len(parts)} file.")
-            self.finished_signal.emit(parts)
-
-        except Exception as e:
-            self.log_signal.emit(f"❌ Lỗi khi extract: {e}")
-            self.finished_signal.emit([])
-
-# -----------------------
 # Main UI
 # -----------------------
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YouTube Downloader - All-in-One")
-        self.resize(820, 620)
+        self.setWindowTitle("YouTube Downloader - All-in-One (Enhanced)")
+        self.resize(900, 680)
 
-        main = QVBoxLayout()
+        # state
+        self.download_thread = None
+        self.extract_thread = None
+        self.list_thread = None
+        self.current_batch_files = []
+        self.selected_format_id = None  # selected custom format id
+        self.log_path = os.path.join(os.getcwd(), "log.txt")
+
+        # UI layout using QTabWidget
+        main_layout = QVBoxLayout()
+        tabs = QTabWidget()
+
+        # --- Tab: Download ---
+        tab_download = QWidget()
+        dl_layout = QVBoxLayout()
 
         row1 = QHBoxLayout()
         self.url_input = QLineEdit()
@@ -216,15 +327,7 @@ class MainWindow(QWidget):
         row1.addWidget(QLabel("Link:"))
         row1.addWidget(self.url_input)
 
-        self.radio_download = QRadioButton("Tải ngay")
-        self.radio_extract = QRadioButton("Extract -> .txt (50/link)")
-        self.radio_download.setChecked(True)
-        radio_group = QButtonGroup(self)
-        radio_group.addButton(self.radio_download)
-        radio_group.addButton(self.radio_extract)
-        row1.addWidget(self.radio_download)
-        row1.addWidget(self.radio_extract)
-        main.addLayout(row1)
+        dl_layout.addLayout(row1)
 
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Chất lượng:"))
@@ -240,7 +343,7 @@ class MainWindow(QWidget):
         row2.addWidget(self.cb_sub)
         row2.addWidget(self.cb_thumb)
         row2.addWidget(self.cb_meta)
-        main.addLayout(row2)
+        dl_layout.addLayout(row2)
 
         row3 = QHBoxLayout()
         self.folder_input = QLineEdit()
@@ -250,56 +353,141 @@ class MainWindow(QWidget):
         row3.addWidget(QLabel("Lưu vào:"))
         row3.addWidget(self.folder_input)
         row3.addWidget(self.btn_browse)
-        main.addLayout(row3)
+        dl_layout.addLayout(row3)
 
         row4 = QHBoxLayout()
         self.btn_action = QPushButton("Thực hiện")
         self.btn_stop = QPushButton("Stop")
         self.btn_update = QPushButton("Update yt-dlp")
+        self.btn_list_formats = QPushButton("List Formats")
         self.btn_load_txt = QPushButton("Load .txt")
         self.btn_open_folder = QPushButton("Mở thư mục")
         row4.addWidget(self.btn_action)
         row4.addWidget(self.btn_stop)
+        row4.addWidget(self.btn_list_formats)
         row4.addWidget(self.btn_update)
         row4.addWidget(self.btn_load_txt)
         row4.addWidget(self.btn_open_folder)
-        main.addLayout(row4)
-
-        main.addWidget(QLabel("Danh sách file .txt (batch):"))
-        self.batch_list = QListWidget()
-        main.addWidget(self.batch_list)
+        dl_layout.addLayout(row4)
 
         self.progress = QProgressBar()
         self.progress.setValue(0)
-        main.addWidget(self.progress)
+        dl_layout.addWidget(self.progress)
 
-        main.addWidget(QLabel("Log:"))
+        dl_layout.addWidget(QLabel("Log:"))
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
-        main.addWidget(self.log_area)
-        self.setLayout(main)
+        dl_layout.addWidget(self.log_area)
 
-        self.download_thread = None
-        self.extract_thread = None
-        self.current_batch_files = []
+        tab_download.setLayout(dl_layout)
+        tabs.addTab(tab_download, "Tải Video")
 
+        # --- Tab: Extract Playlist ---
+        tab_extract = QWidget()
+        ex_layout = QVBoxLayout()
+
+        ex_row1 = QHBoxLayout()
+        self.extract_url_input = QLineEdit()
+        self.extract_url_input.setPlaceholderText("Nhập link playlist / channel để extract")
+        ex_row1.addWidget(QLabel("Link:"))
+        ex_row1.addWidget(self.extract_url_input)
+        ex_layout.addLayout(ex_row1)
+
+        ex_row2 = QHBoxLayout()
+        self.extract_folder_input = QLineEdit()
+        self.extract_folder_input.setPlaceholderText("Thư mục lưu file .txt (mặc định: hiện hành)")
+        self.btn_extract_browse = QPushButton("Browse...")
+        self.btn_extract_browse.clicked.connect(self.choose_folder_extract)
+        self.btn_extract_do = QPushButton("Extract -> .txt (50/link)")
+        ex_row2.addWidget(QLabel("Lưu vào:"))
+        ex_row2.addWidget(self.extract_folder_input)
+        ex_row2.addWidget(self.btn_extract_browse)
+        ex_row2.addWidget(self.btn_extract_do)
+        ex_layout.addLayout(ex_row2)
+
+        ex_layout.addWidget(QLabel("Các file batch được tạo:"))
+        self.extract_batch_list = QListWidget()
+        ex_layout.addWidget(self.extract_batch_list)
+
+        tab_extract.setLayout(ex_layout)
+        tabs.addTab(tab_extract, "Extract Playlist")
+
+        # --- Tab: Batch Manager ---
+        tab_batch = QWidget()
+        bm_layout = QVBoxLayout()
+
+        bm_row1 = QHBoxLayout()
+        bm_row1.addWidget(QLabel("Danh sách file .txt (batch):"))
+        self.btn_batch_add = QPushButton("Add .txt")
+        self.btn_batch_remove = QPushButton("Remove Selected")
+        bm_row1.addWidget(self.btn_batch_add)
+        bm_row1.addWidget(self.btn_batch_remove)
+        bm_layout.addLayout(bm_row1)
+
+        self.batch_list = QListWidget()
+        # allow multiple selection
+        self.batch_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        bm_layout.addWidget(self.batch_list)
+
+        bm_row2 = QHBoxLayout()
+        self.btn_batch_download_selected = QPushButton("Tải file batch đã chọn")
+        self.btn_batch_open_folder = QPushButton("Mở thư mục chứa file")
+        bm_row2.addWidget(self.btn_batch_download_selected)
+        bm_row2.addWidget(self.btn_batch_open_folder)
+        bm_layout.addLayout(bm_row2)
+
+        tab_batch.setLayout(bm_layout)
+        tabs.addTab(tab_batch, "Batch Manager")
+
+        main_layout.addWidget(tabs)
+        self.setLayout(main_layout)
+
+        # connect signals
         self.btn_action.clicked.connect(self.on_action_clicked)
         self.btn_stop.clicked.connect(self.on_stop_clicked)
         self.btn_update.clicked.connect(self.on_update_clicked)
         self.btn_load_txt.clicked.connect(self.on_load_txt_clicked)
         self.btn_open_folder.clicked.connect(self.on_open_folder_clicked)
+        self.btn_list_formats.clicked.connect(self.on_list_formats_clicked)
+        self.btn_extract_do.clicked.connect(self.on_extract_do_clicked)
+        self.btn_batch_add.clicked.connect(self.on_load_txt_clicked)
+        self.btn_batch_remove.clicked.connect(self.on_remove_batch_clicked)
         self.batch_list.itemDoubleClicked.connect(self.on_batch_double_clicked)
+        self.btn_batch_download_selected.clicked.connect(self.on_batch_download_selected)
+        self.btn_batch_open_folder.clicked.connect(self.on_open_batch_folder_clicked)
 
+    # -----------------------
+    # Logging (to UI and file)
+    # -----------------------
     def log(self, msg):
         self.log_area.append(msg)
         self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
+        # write to log file
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
 
+    # -----------------------
+    # Folder selectors
+    # -----------------------
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu", os.getcwd())
         if folder:
             self.folder_input.setText(folder)
             self.log(f"📂 Đã chọn thư mục: {folder}")
+            self.log_path = os.path.join(folder, "log.txt")
 
+    def choose_folder_extract(self):
+        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu extract", os.getcwd())
+        if folder:
+            self.extract_folder_input.setText(folder)
+            self.log(f"📂 Đã chọn thư mục extract: {folder}")
+
+    # -----------------------
+    # Open folder
+    # -----------------------
     def on_open_folder_clicked(self):
         folder = self.folder_input.text().strip() or os.getcwd()
         if os.path.exists(folder):
@@ -315,6 +503,176 @@ class MainWindow(QWidget):
         else:
             self.log("⚠️ Thư mục không tồn tại.")
 
+    def on_open_batch_folder_clicked(self):
+        selected = self.batch_list.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "No selection", "Chọn 1 file trong danh sách batch để mở thư mục.")
+            return
+        filepath = selected[0].data(Qt.UserRole)
+        folder = os.path.dirname(filepath)
+        if os.path.exists(folder):
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(folder)
+                elif sys.platform.startswith("darwin"):
+                    subprocess.Popen(["open", folder])
+                else:
+                    subprocess.Popen(["xdg-open", folder])
+            except Exception as e:
+                self.log(f"⚠️ Không thể mở thư mục: {e}")
+
+    # -----------------------
+    # Action: List Formats
+    # -----------------------
+    def on_list_formats_clicked(self):
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Thiếu dữ liệu", "Vui lòng nhập link video.")
+            return
+        self.btn_list_formats.setEnabled(False)
+        self.list_thread = ListFormatsThread(url)
+        self.list_thread.log_signal.connect(self.log)
+        self.list_thread.result_signal.connect(self.on_formats_ready)
+        self.list_thread.start()
+
+    def on_formats_ready(self, formats, url):
+        self.btn_list_formats.setEnabled(True)
+        if not formats:
+            self.log("⚠️ Không có formats để hiển thị.")
+            return
+
+        # build display list: "id  rest-of-line"
+        items = []
+        for fid, line in formats:
+            # clean line to remove leading id if repeated
+            rest = line
+            # try to remove the id token at start for nicer display
+            m = re.match(r'^\s*' + re.escape(fid) + r'\s*(.*)$', line)
+            if m:
+                rest = m.group(1).strip()
+            items.append(f"{fid}  {rest}")
+
+        item, ok = QInputDialog.getItem(self, "Chọn format ID",
+                                        f"Formats khả dụng cho:\n{url}\n\nChọn 1 format để tải (ID sẽ được lưu):",
+                                        items, 0, False)
+        if ok and item:
+            # extract id from selection (first token)
+            selected_id = item.split()[0]
+            self.selected_format_id = selected_id
+            self.log(f"🎯 Đã chọn format: {selected_id}")
+            # add to combo (as Custom) and select it
+            custom_label = f"Custom:{selected_id}"
+            # avoid duplicates
+            if custom_label not in [self.quality_combo.itemText(i) for i in range(self.quality_combo.count())]:
+                self.quality_combo.addItem(custom_label)
+            self.quality_combo.setCurrentText(custom_label)
+
+    # -----------------------
+    # Action: Update yt-dlp
+    # -----------------------
+    def on_update_clicked(self):
+        self.log("🔄 Cập nhật yt-dlp...")
+        try:
+            res = subprocess.run([YTDLP_CMD, "-U"], capture_output=True, text=True, **get_subprocess_kwargs())
+            self.log(res.stdout.strip())
+            if res.returncode == 0:
+                self.log("✅ Update yt-dlp hoàn tất.")
+            else:
+                self.log(f"⚠️ yt-dlp -U trả về mã {res.returncode}")
+        except Exception as e:
+            self.log(f"❌ Lỗi update yt-dlp: {e}")
+
+    # -----------------------
+    # Load .txt into batch list
+    # -----------------------
+    def on_load_txt_clicked(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Chọn .txt (có thể chọn nhiều)", "", "Text files (*.txt)")
+        if not files:
+            return
+        for file in files:
+            if file not in self.current_batch_files:
+                self.current_batch_files.append(file)
+                item = QListWidgetItem(os.path.basename(file))
+                item.setData(Qt.UserRole, file)
+                self.batch_list.addItem(item)
+                self.log(f"📂 Đã nạp file batch: {file}")
+        # also populate extract list if any (for convenience)
+        for f in files:
+            try:
+                exists = [self.extract_batch_list.item(i).data(Qt.UserRole) for i in range(self.extract_batch_list.count())]
+            except Exception:
+                exists = []
+            if f not in exists:
+                it = QListWidgetItem(os.path.basename(f))
+                it.setData(Qt.UserRole, f)
+                self.extract_batch_list.addItem(it)
+
+    def on_remove_batch_clicked(self):
+        selected = self.batch_list.selectedItems()
+        if not selected:
+            return
+        for it in selected:
+            filepath = it.data(Qt.UserRole)
+            row = self.batch_list.row(it)
+            self.batch_list.takeItem(row)
+            try:
+                self.current_batch_files.remove(filepath)
+            except ValueError:
+                pass
+            self.log(f"🗑️ Đã xóa khỏi batch list: {filepath}")
+
+    # -----------------------
+    # Batch double-click -> download that batch
+    # -----------------------
+    def on_batch_double_clicked(self, item):
+        filepath = item.data(Qt.UserRole)
+        reply = QMessageBox.question(self, "Tải batch",
+                                     f"Tải tất cả video trong file:\n{os.path.basename(filepath)} ?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    urls = [ln.strip() for ln in f if ln.strip()]
+                if urls:
+                    save_path = self.folder_input.text().strip() or os.getcwd()
+                    self.start_download(urls, save_path)
+            except Exception as e:
+                self.log(f"❌ Lỗi khi đọc batch: {e}")
+
+    # -----------------------
+    # Batch Manager: download selected multiple batch files
+    # -----------------------
+    def on_batch_download_selected(self):
+        selected = self.batch_list.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "Chọn file", "Vui lòng chọn ít nhất một file .txt trong Batch Manager.")
+            return
+        aggregated = []
+        seen = set()
+        for it in selected:
+            filepath = it.data(Qt.UserRole)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        if ln not in seen:
+                            seen.add(ln)
+                            aggregated.append(ln)
+            except Exception as e:
+                self.log(f"❌ Lỗi khi đọc {filepath}: {e}")
+
+        if not aggregated:
+            self.log("⚠️ Không có URL để tải từ các file đã chọn.")
+            return
+
+        save_path = self.folder_input.text().strip() or os.getcwd()
+        self.start_download(aggregated, save_path)
+
+    # -----------------------
+    # Main action button behavior (Download or Extract)
+    # -----------------------
     def on_action_clicked(self):
         url = self.url_input.text().strip()
         save_path = self.folder_input.text().strip() or os.getcwd()
@@ -325,37 +683,50 @@ class MainWindow(QWidget):
                 QMessageBox.warning(self, "Lỗi", f"Không thể tạo thư mục: {e}")
                 return
 
-        if self.radio_download.isChecked():
-            selected_items = self.batch_list.selectedItems()
-            if selected_items:
-                filepath = selected_items[0].data(Qt.UserRole)
+        # Determine if user provided a .txt directly in the URL field
+        if url.lower().endswith(".txt") and os.path.exists(url):
+            try:
+                with open(url, "r", encoding="utf-8") as f:
+                    urls = [ln.strip() for ln in f if ln.strip()]
+                if urls:
+                    self.start_download(urls, save_path)
+                return
+            except Exception as e:
+                self.log(f"❌ Lỗi đọc file {url}: {e}")
+                return
+
+        # If there are selected batch files in Batch Manager, use them
+        selected_items = self.batch_list.selectedItems()
+        if selected_items:
+            aggregated = []
+            seen = set()
+            for it in selected_items:
+                filepath = it.data(Qt.UserRole)
                 try:
                     with open(filepath, "r", encoding="utf-8") as f:
-                        urls = [ln.strip() for ln in f if ln.strip()]
-                    if urls:
-                        self.start_download(urls, save_path)
+                        for ln in f:
+                            ln = ln.strip()
+                            if not ln:
+                                continue
+                            if ln not in seen:
+                                seen.add(ln)
+                                aggregated.append(ln)
                 except Exception as e:
-                    self.log(f"❌ Lỗi đọc file {filepath}: {e}")
-            else:
-                if url.lower().endswith(".txt") and os.path.exists(url):
-                    try:
-                        with open(url, "r", encoding="utf-8") as f:
-                            urls = [ln.strip() for ln in f if ln.strip()]
-                        if urls:
-                            self.start_download(urls, save_path)
-                    except Exception as e:
-                        self.log(f"❌ Lỗi đọc file {url}: {e}")
-                else:
-                    if not url:
-                        QMessageBox.warning(self, "Thiếu dữ liệu", "Vui lòng nhập link hoặc chọn .txt")
-                        return
-                    self.start_download([url], save_path)
-        else:
-            if not url:
-                QMessageBox.warning(self, "Thiếu dữ liệu", "Nhập link kênh/playlist để extract")
+                    self.log(f"❌ Lỗi khi đọc {filepath}: {e}")
+            if aggregated:
+                self.start_download(aggregated, save_path)
                 return
-            self.start_extract(url, save_path)
 
+        # Otherwise, treat input as single video/playlist url
+        if not url:
+            QMessageBox.warning(self, "Thiếu dữ liệu", "Vui lòng nhập link hoặc chọn .txt")
+            return
+
+        self.start_download([url], save_path)
+
+    # -----------------------
+    # Start download
+    # -----------------------
     def start_download(self, urls, save_path):
         options = {
             "numbering": self.cb_number.isChecked(),
@@ -365,11 +736,26 @@ class MainWindow(QWidget):
             "concurrent_fragments": True
         }
         quality_key = self.quality_combo.currentText()
+        # if a custom format id was previously selected and current combo is not custom, prefer selected_format_id
+        if self.selected_format_id and not quality_key.lower().startswith("custom:"):
+            # keep user's explicit combo choice unless they picked custom via list; we trust combo
+            pass
+
+        # if combo is "Custom:xxx", set quality_key accordingly
+        if quality_key.lower().startswith("custom:"):
+            quality_key = quality_key.split(":", 1)[1]
+
+        # prepare archive file (downloads.txt) inside save_path
+        archive_file = os.path.join(save_path, "downloads.txt")
+
+        # set log path in chosen folder
+        self.log_path = os.path.join(save_path, "log.txt")
+
         self.btn_action.setEnabled(False)
         self.progress.setValue(0)
         self.log(f"▶️ Bắt đầu tải {len(urls)} video vào: {save_path}")
 
-        self.download_thread = DownloadThread(urls, quality_key, options, save_path)
+        self.download_thread = DownloadThread(urls, quality_key, options, save_path, archive_file=archive_file)
         self.download_thread.log_signal.connect(self.log)
         self.download_thread.percent_signal.connect(self.progress.setValue)
         self.download_thread.finished_signal.connect(self.on_download_finished)
@@ -388,8 +774,22 @@ class MainWindow(QWidget):
         else:
             self.log("⚠️ Không có tiến trình download.")
 
-    def start_extract(self, url, save_path):
-        self.btn_action.setEnabled(False)
+    # -----------------------
+    # Extract button in Extract tab
+    # -----------------------
+    def on_extract_do_clicked(self):
+        url = self.extract_url_input.text().strip()
+        save_path = self.extract_folder_input.text().strip() or os.getcwd()
+        if not url:
+            QMessageBox.warning(self, "Thiếu dữ liệu", "Nhập link kênh/playlist để extract")
+            return
+        if not os.path.isdir(save_path):
+            try:
+                os.makedirs(save_path, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(self, "Lỗi", f"Không thể tạo thư mục: {e}")
+                return
+        self.btn_extract_do.setEnabled(False)
         self.log(f"📑 Extract từ: {url}")
         self.extract_thread = ExtractThread(url, save_path, batch_size=50)
         self.extract_thread.log_signal.connect(self.log)
@@ -397,54 +797,22 @@ class MainWindow(QWidget):
         self.extract_thread.start()
 
     def on_extract_finished(self, generated_files):
-        self.btn_action.setEnabled(True)
-        self.current_batch_files = generated_files
-        self.batch_list.clear()
+        self.btn_extract_do.setEnabled(True)
+        # add to both the extract list and batch manager
         for f in generated_files:
-            item = QListWidgetItem(os.path.basename(f))
-            item.setData(Qt.UserRole, f)
-            self.batch_list.addItem(item)
+            it = QListWidgetItem(os.path.basename(f))
+            it.setData(Qt.UserRole, f)
+            self.extract_batch_list.addItem(it)
+            # also add to main batch manager (if not already)
+            if f not in self.current_batch_files:
+                self.current_batch_files.append(f)
+                i2 = QListWidgetItem(os.path.basename(f))
+                i2.setData(Qt.UserRole, f)
+                self.batch_list.addItem(i2)
         if generated_files:
             self.log(f"📂 Đã tạo {len(generated_files)} file batch.")
         else:
             self.log("⚠️ Không tạo được file batch.")
-
-    def on_load_txt_clicked(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Chọn .txt", "", "Text files (*.txt)")
-        if not file:
-            return
-        self.current_batch_files.append(file)
-        item = QListWidgetItem(os.path.basename(file))
-        item.setData(Qt.UserRole, file)
-        self.batch_list.addItem(item)
-        self.log(f"📂 Đã nạp file batch: {file}")
-
-    def on_batch_double_clicked(self, item):
-        filepath = item.data(Qt.UserRole)
-        reply = QMessageBox.question(self, "Tải batch",
-                                     f"Tải tất cả video trong file:\n{os.path.basename(filepath)} ?",
-                                     QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    urls = [ln.strip() for ln in f if ln.strip()]
-                if urls:
-                    save_path = self.folder_input.text().strip() or os.getcwd()
-                    self.start_download(urls, save_path)
-            except Exception as e:
-                self.log(f"❌ Lỗi khi đọc batch: {e}")
-
-    def on_update_clicked(self):
-        self.log("🔄 Cập nhật yt-dlp...")
-        try:
-            res = subprocess.run([YTDLP_CMD, "-U"], capture_output=True, text=True)
-            self.log(res.stdout.strip())
-            if res.returncode == 0:
-                self.log("✅ Update yt-dlp hoàn tất.")
-            else:
-                self.log(f"⚠️ yt-dlp -U trả về mã {res.returncode}")
-        except Exception as e:
-            self.log(f"❌ Lỗi update yt-dlp: {e}")
 
 # -----------------------
 # Entry point
