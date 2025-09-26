@@ -235,6 +235,13 @@ class DownloadThread(QThread):
                 "-o", os.path.join(self.save_path, out_template),
             ]
 
+            # --- FIX: Thêm độ trễ để tránh bị YouTube chặn (Lỗi 429) ---
+            # Chờ 10 giây sau mỗi lần tải video.
+            cmd += ["--sleep-interval", "10"]
+            # Nếu YouTube bắt đầu giới hạn tốc độ, chờ ngẫu nhiên tối đa 20 giây.
+            cmd += ["--max-sleep-interval", "20"]
+            # --- END FIX ---
+
             if self.options.get("subtitle"):
                 cmd += ["--write-auto-subs", "--convert-subs", "srt"]
             if self.options.get("thumbnail"):
@@ -566,8 +573,8 @@ class MainWindow(QWidget):
             items.append(f"{fid}  {rest}")
 
         item, ok = QInputDialog.getItem(self, "Chọn format ID",
-                                         f"Formats khả dụng cho:\n{url}\n\nChọn 1 format để tải (ID sẽ được lưu):",
-                                         items, 0, False)
+                                      f"Formats khả dụng cho:\n{url}\n\nChọn 1 format để tải (ID sẽ được lưu):",
+                                      items, 0, False)
         if ok and item:
             # extract id from selection (first token)
             selected_id = item.split()[0]
