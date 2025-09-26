@@ -196,10 +196,10 @@ class DownloadThread(QThread):
             return "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio"
         elif self.quality_key == "720p":
             return ("bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]"
-                    "/bestvideo[height<=720]+bestaudio")
+                            "/bestvideo[height<=720]+bestaudio")
         elif self.quality_key == "480p":
             return ("bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]"
-                    "/bestvideo[height<=480]+bestaudio")
+                            "/bestvideo[height<=480]+bestaudio")
         else:
             return "bestaudio[ext=m4a]/bestaudio"
 
@@ -292,7 +292,6 @@ class DownloadThread(QThread):
         if self.process:
             try:
                 self.process.terminate()
-                self.process.kill()
             except Exception:
                 pass
 
@@ -302,7 +301,7 @@ class DownloadThread(QThread):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YouTube Downloader - All-in-One (Enhanced)")
+        self.setWindowTitle("YouTube Downloader By Lý Văn Hiệp") # Changed title here
         self.resize(900, 680)
 
         # state
@@ -553,8 +552,8 @@ class MainWindow(QWidget):
             items.append(f"{fid}  {rest}")
 
         item, ok = QInputDialog.getItem(self, "Chọn format ID",
-                                        f"Formats khả dụng cho:\n{url}\n\nChọn 1 format để tải (ID sẽ được lưu):",
-                                        items, 0, False)
+                                         f"Formats khả dụng cho:\n{url}\n\nChọn 1 format để tải (ID sẽ được lưu):",
+                                         items, 0, False)
         if ok and item:
             # extract id from selection (first token)
             selected_id = item.split()[0]
