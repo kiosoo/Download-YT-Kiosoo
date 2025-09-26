@@ -213,9 +213,20 @@ class DownloadThread(QThread):
 
             self.log_signal.emit(f"▶️ Đang tải video {idx}/{total}: {url}")
 
-            out_template = "%(title)s.%(ext)s"
+            # --- MODIFIED: Improved filename numbering ---
+            # Always include video ID to prevent overwrites from duplicate titles
+            out_template = "%(title)s [%(id)s].%(ext)s"
             if self.options.get("numbering"):
-                out_template = "%(playlist_index)03d - %(title)s.%(ext)s"
+                if total > 1:
+                    # It's a list of URLs. Prioritize the list index over playlist's internal index
+                    # to avoid double numbering like "002 - 00001 - title".
+                    # yt-dlp will handle name collisions for videos inside a playlist automatically.
+                    out_template = f"{idx:03d} - %(title)s [%(id)s].%(ext)s"
+                else:
+                    # It's a single URL (could be a video or a playlist).
+                    # Use yt-dlp's internal numbering for playlists.
+                    out_template = "%(autonumber)s - %(title)s [%(id)s].%(ext)s"
+            # --- END MODIFICATION ---
 
             cmd = [
                 YTDLP_CMD,
@@ -321,8 +332,11 @@ class MainWindow(QWidget):
         dl_layout = QVBoxLayout()
 
         row1 = QHBoxLayout()
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Nhập link video / playlist / channel")
+        # --- MODIFIED: Use QTextEdit for multiple links ---
+        self.url_input = QTextEdit()
+        self.url_input.setPlaceholderText("Nhập một hoặc nhiều link video / playlist / channel (mỗi link một dòng)")
+        self.url_input.setFixedHeight(80)
+        # --- END MODIFICATION ---
         row1.addWidget(QLabel("Link:"))
         row1.addWidget(self.url_input)
 
@@ -524,7 +538,7 @@ class MainWindow(QWidget):
     # Action: List Formats
     # -----------------------
     def on_list_formats_clicked(self):
-        url = self.url_input.text().strip()
+        url = self.url_input.toPlainText().strip().split('\n')[0]
         if not url:
             QMessageBox.warning(self, "Thiếu dữ liệu", "Vui lòng nhập link video.")
             return
@@ -673,7 +687,6 @@ class MainWindow(QWidget):
     # Main action button behavior (Download or Extract)
     # -----------------------
     def on_action_clicked(self):
-        url = self.url_input.text().strip()
         save_path = self.folder_input.text().strip() or os.getcwd()
         if not os.path.isdir(save_path):
             try:
@@ -682,46 +695,37 @@ class MainWindow(QWidget):
                 QMessageBox.warning(self, "Lỗi", f"Không thể tạo thư mục: {e}")
                 return
 
-        # Determine if user provided a .txt directly in the URL field
-        if url.lower().endswith(".txt") and os.path.exists(url):
-            try:
-                with open(url, "r", encoding="utf-8") as f:
-                    urls = [ln.strip() for ln in f if ln.strip()]
-                if urls:
-                    self.start_download(urls, save_path)
-                return
-            except Exception as e:
-                self.log(f"❌ Lỗi đọc file {url}: {e}")
-                return
+        # --- MODIFIED: Handle multiple sources of URLs ---
+        # Priority 1: Get URLs from the text input box
+        urls_from_input = [line.strip() for line in self.url_input.toPlainText().strip().split('\n') if line.strip()]
 
-        # If there are selected batch files in Batch Manager, use them
-        selected_items = self.batch_list.selectedItems()
-        if selected_items:
-            aggregated = []
-            seen = set()
-            for it in selected_items:
-                filepath = it.data(Qt.UserRole)
+        if urls_from_input:
+            # Special case: a single line in the input is a path to a .txt file
+            if len(urls_from_input) == 1 and urls_from_input[0].lower().endswith(".txt") and os.path.exists(urls_from_input[0]):
                 try:
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        for ln in f:
-                            ln = ln.strip()
-                            if not ln:
-                                continue
-                            if ln not in seen:
-                                seen.add(ln)
-                                aggregated.append(ln)
+                    with open(urls_from_input[0], "r", encoding="utf-8") as f:
+                        urls = [ln.strip() for ln in f if ln.strip()]
+                    if urls:
+                        self.start_download(urls, save_path)
+                    else:
+                        self.log(f"⚠️ File {urls_from_input[0]} rỗng.")
                 except Exception as e:
-                    self.log(f"❌ Lỗi khi đọc {filepath}: {e}")
-            if aggregated:
-                self.start_download(aggregated, save_path)
-                return
-
-        # Otherwise, treat input as single video/playlist url
-        if not url:
-            QMessageBox.warning(self, "Thiếu dữ liệu", "Vui lòng nhập link hoặc chọn .txt")
+                    self.log(f"❌ Lỗi đọc file {urls_from_input[0]}: {e}")
+            else:
+                # Standard case: download the URLs from the input box
+                self.start_download(urls_from_input, save_path)
             return
 
-        self.start_download([url], save_path)
+        # Priority 2: If input box is empty, check for selected files in Batch Manager
+        selected_items = self.batch_list.selectedItems()
+        if selected_items:
+            self.on_batch_download_selected()
+            return
+
+        # If we reach here, no input was provided
+        QMessageBox.warning(self, "Thiếu dữ liệu", "Vui lòng nhập link hoặc chọn một file trong Batch Manager.")
+        # --- END MODIFICATION ---
+
 
     # -----------------------
     # Start download
@@ -735,19 +739,13 @@ class MainWindow(QWidget):
             "concurrent_fragments": True
         }
         quality_key = self.quality_combo.currentText()
-        # if a custom format id was previously selected and current combo is not custom, prefer selected_format_id
         if self.selected_format_id and not quality_key.lower().startswith("custom:"):
-            # keep user's explicit combo choice unless they picked custom via list; we trust combo
             pass
 
-        # if combo is "Custom:xxx", set quality_key accordingly
         if quality_key.lower().startswith("custom:"):
             quality_key = quality_key.split(":", 1)[1]
 
-        # prepare archive file (downloads.txt) inside save_path
         archive_file = os.path.join(save_path, "downloads.txt")
-
-        # set log path in chosen folder
         self.log_path = os.path.join(save_path, "log.txt")
 
         self.btn_action.setEnabled(False)
